@@ -20,10 +20,17 @@
 (define-constant ERR_INSUFFICIENT_TOKENS (err u111))
 (define-constant ERR_CANNOT_FILL_OWN_ORDER (err u112))
 (define-constant ERR_ORDER_EXPIRED (err u113))
+(define-constant ERR_DELEGATION_NOT_FOUND (err u114))
+(define-constant ERR_DELEGATION_LOOP (err u115))
+(define-constant ERR_DELEGATION_EXPIRED (err u116))
+(define-constant ERR_INVALID_DELEGATION_TYPE (err u117))
+(define-constant ERR_DELEGATION_ALREADY_EXISTS (err u118))
+(define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u119))
 
 (define-data-var total-supply uint u0)
 (define-data-var milestone-counter uint u0)
 (define-data-var order-counter uint u0)
+(define-data-var delegation-counter uint u0)
 
 (define-map vesting-schedules
   { recipient: principal }
@@ -69,6 +76,38 @@
 (define-map user-orders
   { user: principal, order-id: uint }
   { exists: bool }
+)
+
+(define-map delegations
+  { delegator: principal, delegation-type: uint }
+  {
+    delegate: principal,
+    created-at: uint,
+    expires-at: uint,
+    is-active: bool,
+    delegation-id: uint
+  }
+)
+
+(define-map delegation-registry
+  { delegation-id: uint }
+  {
+    delegator: principal,
+    delegate: principal,
+    delegation-type: uint,
+    voting-power: uint,
+    created-at: uint,
+    expires-at: uint,
+    is-active: bool
+  }
+)
+
+(define-map delegate-powers
+  { delegate: principal, delegation-type: uint }
+  {
+    total-voting-power: uint,
+    active-delegations: uint
+  }
 )
 
 (define-public (mint-tokens (amount uint))
@@ -461,3 +500,225 @@
     u0
   )
 )
+
+(define-public (create-delegation (delegate principal) (delegation-type uint) (blocks-until-expiry uint))
+  (let
+    (
+      (delegation-id (+ (var-get delegation-counter) u1))
+      (expires-at (+ stacks-block-height blocks-until-expiry))
+      (delegator-balance (ft-get-balance equity-token tx-sender))
+      (existing-delegation (map-get? delegations { delegator: tx-sender, delegation-type: delegation-type }))
+    )
+    (asserts! (not (is-eq tx-sender delegate)) ERR_CANNOT_DELEGATE_TO_SELF)
+    (asserts! (> delegator-balance u0) ERR_INSUFFICIENT_TOKENS)
+    (asserts! (> blocks-until-expiry u0) ERR_INVALID_AMOUNT)
+    (asserts! (< delegation-type u4) ERR_INVALID_DELEGATION_TYPE)
+    (asserts! (is-none existing-delegation) ERR_DELEGATION_ALREADY_EXISTS)
+    (asserts! (not (would-create-delegation-loop tx-sender delegate)) ERR_DELEGATION_LOOP)
+    
+    (map-set delegations
+      { delegator: tx-sender, delegation-type: delegation-type }
+      {
+        delegate: delegate,
+        created-at: stacks-block-height,
+        expires-at: expires-at,
+        is-active: true,
+        delegation-id: delegation-id
+      }
+    )
+    
+    (map-set delegation-registry
+      { delegation-id: delegation-id }
+      {
+        delegator: tx-sender,
+        delegate: delegate,
+        delegation-type: delegation-type,
+        voting-power: delegator-balance,
+        created-at: stacks-block-height,
+        expires-at: expires-at,
+        is-active: true
+      }
+    )
+    
+    (let
+      (
+        (current-powers (default-to { total-voting-power: u0, active-delegations: u0 } 
+                        (map-get? delegate-powers { delegate: delegate, delegation-type: delegation-type })))
+      )
+      (map-set delegate-powers
+        { delegate: delegate, delegation-type: delegation-type }
+        {
+          total-voting-power: (+ (get total-voting-power current-powers) delegator-balance),
+          active-delegations: (+ (get active-delegations current-powers) u1)
+        }
+      )
+    )
+    
+    (var-set delegation-counter delegation-id)
+    (ok delegation-id)
+  )
+)
+
+(define-public (revoke-delegation (delegation-type uint))
+  (let
+    (
+      (delegation (unwrap! (map-get? delegations { delegator: tx-sender, delegation-type: delegation-type }) ERR_DELEGATION_NOT_FOUND))
+      (delegate (get delegate delegation))
+      (delegation-id (get delegation-id delegation))
+      (voting-power (ft-get-balance equity-token tx-sender))
+      (current-powers (unwrap! (map-get? delegate-powers { delegate: delegate, delegation-type: delegation-type }) ERR_DELEGATION_NOT_FOUND))
+    )
+    (asserts! (get is-active delegation) ERR_DELEGATION_NOT_FOUND)
+    
+    (map-set delegations
+      { delegator: tx-sender, delegation-type: delegation-type }
+      (merge delegation { is-active: false })
+    )
+    
+    (map-set delegation-registry
+      { delegation-id: delegation-id }
+      (merge (unwrap-panic (map-get? delegation-registry { delegation-id: delegation-id })) { is-active: false })
+    )
+    
+    (map-set delegate-powers
+      { delegate: delegate, delegation-type: delegation-type }
+      {
+        total-voting-power: (- (get total-voting-power current-powers) voting-power),
+        active-delegations: (- (get active-delegations current-powers) u1)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (transfer-delegation (from-delegate principal) (to-delegate principal) (delegation-type uint))
+  (let
+    (
+      (delegation (unwrap! (map-get? delegations { delegator: tx-sender, delegation-type: delegation-type }) ERR_DELEGATION_NOT_FOUND))
+      (delegation-id (get delegation-id delegation))
+      (voting-power (ft-get-balance equity-token tx-sender))
+      (from-powers (unwrap! (map-get? delegate-powers { delegate: from-delegate, delegation-type: delegation-type }) ERR_DELEGATION_NOT_FOUND))
+      (to-powers (default-to { total-voting-power: u0, active-delegations: u0 } 
+                  (map-get? delegate-powers { delegate: to-delegate, delegation-type: delegation-type })))
+    )
+    (asserts! (not (is-eq tx-sender to-delegate)) ERR_CANNOT_DELEGATE_TO_SELF)
+    (asserts! (is-eq (get delegate delegation) from-delegate) ERR_UNAUTHORIZED)
+    (asserts! (get is-active delegation) ERR_DELEGATION_NOT_FOUND)
+    (asserts! (< stacks-block-height (get expires-at delegation)) ERR_DELEGATION_EXPIRED)
+    (asserts! (not (would-create-delegation-loop tx-sender to-delegate)) ERR_DELEGATION_LOOP)
+    
+    (map-set delegations
+      { delegator: tx-sender, delegation-type: delegation-type }
+      (merge delegation { delegate: to-delegate })
+    )
+    
+    (map-set delegation-registry
+      { delegation-id: delegation-id }
+      (merge (unwrap-panic (map-get? delegation-registry { delegation-id: delegation-id })) { delegate: to-delegate })
+    )
+    
+    (map-set delegate-powers
+      { delegate: from-delegate, delegation-type: delegation-type }
+      {
+        total-voting-power: (- (get total-voting-power from-powers) voting-power),
+        active-delegations: (- (get active-delegations from-powers) u1)
+      }
+    )
+    
+    (map-set delegate-powers
+      { delegate: to-delegate, delegation-type: delegation-type }
+      {
+        total-voting-power: (+ (get total-voting-power to-powers) voting-power),
+        active-delegations: (+ (get active-delegations to-powers) u1)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (execute-delegated-action (action-type uint) (target principal) (amount uint))
+  (let
+    (
+      (delegate-power (default-to { total-voting-power: u0, active-delegations: u0 } 
+                      (map-get? delegate-powers { delegate: tx-sender, delegation-type: action-type })))
+      (required-power (/ amount u2))
+    )
+    (asserts! (>= (get total-voting-power delegate-power) required-power) ERR_INSUFFICIENT_TOKENS)
+    (asserts! (> (get active-delegations delegate-power) u0) ERR_DELEGATION_NOT_FOUND)
+    
+    (if (is-eq action-type u1)
+      (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (ok true)
+      )
+      (if (is-eq action-type u2)
+        (begin
+          (try! (ft-transfer? equity-token amount tx-sender target))
+          (ok true)
+        )
+        (ok false)
+      )
+    )
+  )
+)
+
+(define-read-only (get-delegation (delegator principal) (delegation-type uint))
+  (map-get? delegations { delegator: delegator, delegation-type: delegation-type })
+)
+
+(define-read-only (get-delegation-by-id (delegation-id uint))
+  (map-get? delegation-registry { delegation-id: delegation-id })
+)
+
+(define-read-only (get-delegate-power (delegate principal) (delegation-type uint))
+  (default-to { total-voting-power: u0, active-delegations: u0 } 
+              (map-get? delegate-powers { delegate: delegate, delegation-type: delegation-type }))
+)
+
+(define-read-only (is-delegation-active (delegator principal) (delegation-type uint))
+  (match (map-get? delegations { delegator: delegator, delegation-type: delegation-type })
+    delegation
+    (and 
+      (get is-active delegation)
+      (< stacks-block-height (get expires-at delegation)))
+    false
+  )
+)
+
+(define-read-only (get-delegation-counter)
+  (var-get delegation-counter)
+)
+
+(define-read-only (would-create-delegation-loop (delegator principal) (delegate principal))
+  (let
+    (
+      (delegate-delegation (map-get? delegations { delegator: delegate, delegation-type: u1 }))
+    )
+    (match delegate-delegation
+      delegation
+      (if (get is-active delegation)
+        (is-eq (get delegate delegation) delegator)
+        false)
+      false
+    )
+  )
+)
+
+(define-read-only (calculate-effective-voting-power (account principal))
+  (let
+    (
+      (base-power (ft-get-balance equity-token account))
+      (delegated-power-governance (get total-voting-power (get-delegate-power account u1)))
+      (delegated-power-transfer (get total-voting-power (get-delegate-power account u2)))
+    )
+    {
+      base-voting-power: base-power,
+      delegated-governance-power: delegated-power-governance,
+      delegated-transfer-power: delegated-power-transfer,
+      total-effective-power: (+ base-power delegated-power-governance)
+    }
+  )
+)
+
