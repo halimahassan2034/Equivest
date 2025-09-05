@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Equivest.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.cap-table-manager]
+path = 'contracts/cap-table-manager.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
